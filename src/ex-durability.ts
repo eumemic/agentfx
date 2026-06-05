@@ -1,0 +1,31 @@
+// ex-durability.ts — the distributed interpreter inherits crash-survival. Fan out 12
+// tasks via runDist; an external killer SIGKILLs the executor mid-batch; at-least-once
+// redelivery to the restarted executor still completes every task.
+
+import { forEachPar } from "./effect";
+import { runDist } from "./interpret";
+import { makeIIIBackend } from "./runtime-iii";
+import { upper } from "./tasks";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const items = Array.from({ length: 12 }, (_, i) => `task-${i}`);
+
+const program = forEachPar(items, (s) => upper.effect(s), 3);
+
+console.log("connecting to engine...");
+await sleep(1500);
+
+console.log(`\n=== runDist over ${items.length} tasks; executor will be killed mid-batch ===`);
+const be = makeIIIBackend();
+const t0 = Date.now();
+const r = await runDist(program, {}, be, new AbortController().signal);
+const secs = ((Date.now() - t0) / 1000).toFixed(1);
+
+if (r.ok) {
+  console.log(`\nall ${r.value.length}/${items.length} completed in ${secs}s — despite the kill`);
+  console.log("results:", r.value.join(", "));
+  process.exit(0);
+} else {
+  console.log("FAILED:", r.error);
+  process.exit(1);
+}

@@ -142,6 +142,10 @@ export interface TaskDef<In, Out, E = unknown> {
   readonly keyOf: (input: In) => string;
   readonly impl: (input: In, ctx: TaskCtx) => Promise<Out>;
   readonly effect: (input: In) => Effect<unknown, E, Out> & Replayable;
+  /** Optional JSON Schemas published to the engine as request_format / response_format.
+   *  Set by `schemaTask` (see schema.ts); plain tasks leave them undefined. */
+  readonly requestFormat?: unknown;
+  readonly responseFormat?: unknown;
 }
 
 /** Define a distributable task: a named function with a derived idempotency key. Its effect

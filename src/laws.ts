@@ -4,6 +4,7 @@
 
 import { type Effect, flatMap, provide, retry, succeed, task } from "./effect";
 import { runMemory } from "./interpret";
+import { greet } from "./tasks";
 
 const sig = new AbortController().signal;
 
@@ -36,3 +37,10 @@ declare const need: Effect<LLM & DB, string, number>;
 provide(need, { llm: 1 }); // ✓ discharges `llm`; the result still requires `db`
 // @ts-expect-error — `bogus` is not a key of R
 provide(need, { llm: 1, bogus: 9 });
+
+// ── LAW 4: schemaTask infers In/Out from the zod schema — callers are typed ─
+greet.effect({ name: "ada", times: 3 }); // ✓ matches the schema
+// @ts-expect-error — `times` must be a number (inferred from z.number())
+greet.effect({ name: "ada", times: "lots" });
+// @ts-expect-error — missing required `name`
+greet.effect({ times: 1 });

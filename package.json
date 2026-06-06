@@ -2,7 +2,15 @@
   "name": "agentfx",
   "version": "0.1.0",
   "description": "A typed effect system whose production interpreter is a durable distributed runtime (iii). One program, two interpreters, differentially tested.",
-  "keywords": ["effect-system", "typescript", "agents", "durable", "iii", "interpreter", "at-least-once"],
+  "keywords": [
+    "effect-system",
+    "typescript",
+    "agents",
+    "durable",
+    "iii",
+    "interpreter",
+    "at-least-once"
+  ],
   "license": "MIT",
   "type": "module",
   "types": "./src/index.ts",
@@ -12,17 +20,28 @@
       "import": "./src/index.ts"
     }
   },
-  "files": ["src/effect.ts", "src/interpret.ts", "src/runtime-iii.ts", "src/index.ts", "README.md", "LICENSE"],
+  "files": [
+    "src/effect.ts",
+    "src/interpret.ts",
+    "src/runtime-iii.ts",
+    "src/schema.ts",
+    "src/util.ts",
+    "src/index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit",
     "executor": "tsx src/ex-executor.ts",
     "differential": "tsx src/ex-differential.ts",
     "durability": "tsx src/ex-durability.ts",
+    "schema": "tsx src/ex-schema.ts",
     "preempt": "tsx src/demo.ts"
   },
   "dependencies": {
-    "iii-sdk": "0.11.0"
+    "iii-sdk": "0.11.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

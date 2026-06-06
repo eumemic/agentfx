@@ -95,9 +95,18 @@ export function startExecutor(tasks: ReadonlyArray<TaskDef<any, any, any>>, opts
 
   const impls = new Map(tasks.map((t) => [t.fnId, t.impl] as const));
   for (const t of tasks) {
-    w.registerFunction(t.fnId, ((payload: unknown) => t.impl(payload, { idempotencyKey: t.keyOf(payload as any) })) as unknown as (
-      p: unknown,
-    ) => Promise<unknown>);
+    w.registerFunction(
+      t.fnId,
+      ((payload: unknown) => t.impl(payload, { idempotencyKey: t.keyOf(payload as any) })) as unknown as (
+        p: unknown,
+      ) => Promise<unknown>,
+      // publish the schema (request_format/response_format) when the task carries one
+      {
+        description: `agentfx task ${t.fnId}`,
+        request_format: t.requestFormat,
+        response_format: t.responseFormat,
+      } as unknown as Parameters<typeof w.registerFunction>[2],
+    );
   }
 
   w.registerFunction(

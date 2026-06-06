@@ -83,6 +83,33 @@ executor `kill -9` mid-batch.
 | `forEachTask(items, task, n)` | type-safe distributable fan-out (children guaranteed `Remote`) |
 | `forEachPar(items, f, n)` | generic fan-out; **`runDist` requires `task` children** (closures don't serialize → it throws) |
 
+## Typing the wire (optional): `schemaTask`
+
+The cross-worker boundary is stringly-typed by default. `schemaTask` closes that with one
+[zod](https://zod.dev) schema that becomes three things at once:
+
+- **static types** — `In`/`Out` are inferred via `z.infer`, so callers are compile-time checked
+- **a published JSON Schema** — sent to the engine as `request_format`/`response_format`; read it
+  back with `iii trigger engine::functions::info --json '{"function_id":"agentfx::greet"}'`
+  (discoverable by the console and LLM tool-use)
+- **runtime validation** — a bad payload is rejected at the executor and rides the `fail()`
+  channel as a `ZodError`
+
+```ts
+const greet = schemaTask(
+  "agentfx::greet",
+  { input: z.object({ name: z.string().min(1), times: z.number().int().min(1).max(5) }),
+    output: z.string() },
+  async ({ name, times }) => Array.from({ length: times }, () => `hi ${name}`).join(" "),
+);
+
+greet.effect({ name: "ada", times: 3 });       // ✓ typed
+greet.effect({ name: "ada", times: "lots" });  // ✗ compile error (inferred from the schema)
+```
+
+`npm run schema` runs it live. (Caveat: the engine stores the schema under `request_schema` in
+`functions::info`; the `iii trigger <fn> --help` view doesn't surface it yet — a CLI display gap.)
+
 ## How `runDist` lowers to iii
 
 | node | `runMemory` | `runDist` (iii) |

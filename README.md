@@ -139,6 +139,32 @@ still call anything in any language, type-safe. `npm run gen` regenerates agains
 running. (`remote()` calls run under `runDist` only — there's no in-process impl for another
 worker's function.)
 
+## A real agent (Claude + a polyglot tool)
+
+The point of all the machinery: a real LLM agent whose tools are iii workers — in any language —
+with durable, preemptible turn semantics. `ex-agent.ts` runs Claude (`claude-opus-4-8`) in a ReAct
+loop whose `add` tool is the **Python** `pymath::add` worker, invoked through the typed `remote()`
+client:
+
+```
+Claude → tool call `add` → remote("pymath::add") → runDist → iii engine → Python worker → result
+```
+
+```bash
+npm run agent          # "what is 21 + 21, then add 100?" → calls the Python tool twice → 142
+npm run preempt-agent  # a new message mid-turn preempts the in-flight turn
+```
+
+`ex-preempt-agent.ts` answers the question this repo kept circling: **does preemption compose with
+a real, multi-step LLM turn?** A new user message arrives mid-turn; the in-flight inference is
+aborted (soft — saves tokens) and every tool call is gated on the epoch fence (hard). Result: only
+the latest message's tool fires; the superseded turn is fenced out. The fence sits at the tool
+boundary, so it holds regardless of how long or variable the real inference is.
+
+Needs `ANTHROPIC_API_KEY` (and optional `ANTHROPIC_BASE_URL`) plus the `pymath` worker running
+(`python pymath_worker.py`). The model call is non-streaming with adaptive thinking and an
+`AbortSignal` for preemption.
+
 ## How `runDist` lowers to iii
 
 | node | `runMemory` | `runDist` (iii) |

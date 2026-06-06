@@ -43,9 +43,12 @@
     "catch": "tsx src/ex-catch.ts",
     "gen": "tsx src/gen.ts",
     "remote": "tsx src/ex-remote.ts",
+    "agent": "tsx src/ex-agent.ts",
+    "preempt-agent": "tsx src/ex-preempt-agent.ts",
     "preempt": "tsx src/demo.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
     "iii-sdk": "0.11.0",
     "zod": "^4.4.3"
   },

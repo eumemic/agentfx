@@ -110,6 +110,12 @@ greet.effect({ name: "ada", times: "lots" });  // ✗ compile error (inferred fr
 `npm run schema` runs it live. (Caveat: the engine stores the schema under `request_schema` in
 `functions::info`; the `iii trigger <fn> --help` view doesn't surface it yet — a CLI display gap.)
 
+A contract violation is just a typed failure, so `catchAll` recovers it into a branch —
+`catchAll(parseAmount.effect(s), () => succeed(0))` turns a bad parse into a fallback,
+identically under both interpreters (`npm run catch`). The recovered value matches across
+backends; the raw error *shape* differs by design (structured `ZodError` in-process, a message
+string over the wire).
+
 ## How `runDist` lowers to iii
 
 | node | `runMemory` | `runDist` (iii) |

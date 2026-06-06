@@ -37,6 +37,7 @@
     "differential": "tsx src/ex-differential.ts",
     "durability": "tsx src/ex-durability.ts",
     "schema": "tsx src/ex-schema.ts",
+    "catch": "tsx src/ex-catch.ts",
     "preempt": "tsx src/demo.ts"
   },
   "dependencies": {

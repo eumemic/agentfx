@@ -50,4 +50,13 @@ export const greet = schemaTask(
   },
 );
 
-export const allTasks = [upper, lengthOf, flaky, greet];
+/** Parse a string to a finite number. The OUTPUT contract is `z.number().finite()`, so a
+ *  non-numeric input ("oops" -> NaN) violates the task's own declared output and is rejected
+ *  at the boundary as a ZodError — a typed failure `catchAll` can recover from. */
+export const parseAmount = schemaTask(
+  "agentfx::parseAmount",
+  { input: z.string(), output: z.number().finite() },
+  async (s) => Number(s),
+);
+
+export const allTasks = [upper, lengthOf, flaky, greet, parseAmount];

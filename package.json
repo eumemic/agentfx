@@ -25,6 +25,9 @@
     "src/interpret.ts",
     "src/runtime-iii.ts",
     "src/schema.ts",
+    "src/remote.ts",
+    "src/contracts.generated.ts",
+    "src/gen.ts",
     "src/util.ts",
     "src/index.ts",
     "README.md",
@@ -38,6 +41,8 @@
     "durability": "tsx src/ex-durability.ts",
     "schema": "tsx src/ex-schema.ts",
     "catch": "tsx src/ex-catch.ts",
+    "gen": "tsx src/gen.ts",
+    "remote": "tsx src/ex-remote.ts",
     "preempt": "tsx src/demo.ts"
   },
   "dependencies": {

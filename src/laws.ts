@@ -5,6 +5,7 @@
 import { type Effect, flatMap, provide, retry, succeed, task } from "./effect";
 import { runMemory } from "./interpret";
 import { greet } from "./tasks";
+import { remote } from "./remote";
 
 const sig = new AbortController().signal;
 
@@ -44,3 +45,11 @@ greet.effect({ name: "ada", times: 3 }); // ✓ matches the schema
 greet.effect({ name: "ada", times: "lots" });
 // @ts-expect-error — missing required `name`
 greet.effect({ times: 1 });
+
+// ── LAW 5: remote() types come from a worker's DECLARED contract (any language) ─
+// pymath::add is implemented in Python; these types were codegen'd from its contract.
+remote("pymath::add")({ a: 1, b: 2 }); // ✓
+// @ts-expect-error — `b` must be a number (derived from pymath::add's published schema)
+remote("pymath::add")({ a: 1, b: "two" });
+// @ts-expect-error — not a function id present on the engine's registry
+remote("nope::missing")({});

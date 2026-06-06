@@ -116,6 +116,29 @@ identically under both interpreters (`npm run catch`). The recovered value match
 backends; the raw error *shape* differs by design (structured `ZodError` in-process, a message
 string over the wire).
 
+## Types from other workers' contracts (any language)
+
+`schemaTask` types the surface *you* author. But you also call functions implemented by *other*
+workers — maybe in Python or Rust. Those workers declare their own contracts
+(`request_format`/`response_format`), which the engine stores. `npm run gen` walks the live
+registry and writes `src/contracts.generated.ts` — a typed `Contracts` map of every declared
+function, regardless of language. `remote(fnId)` is statically typed from it:
+
+```ts
+// pymath::add is implemented in PYTHON (pymath_worker.py); its contract is declared there.
+const r = await runDist(remote("pymath::add")({ a: 2, b: 3 }), {}, be);
+//        remote("pymath::add") : (input: { a: number; b: number }) => Effect<…, { sum: number }>
+//        r.value is typed { sum: number } — derived from the Python worker, not hand-written.
+
+remote("pymath::add")({ a: 1, b: "two" }); // ✗ compile error (b: number, from the Python contract)
+```
+
+The engine is the IDL: a worker's contract flows to the consumer in *its* preferred typed
+language. That's the polyglot-substrate property made concrete — you work in TypeScript and
+still call anything in any language, type-safe. `npm run gen` regenerates against whatever's
+running. (`remote()` calls run under `runDist` only — there's no in-process impl for another
+worker's function.)
+
 ## How `runDist` lowers to iii
 
 | node | `runMemory` | `runDist` (iii) |

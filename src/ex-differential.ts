@@ -1,46 +1,46 @@
-// ex-differential.ts — THE headline proof. One typed program; two interpreters;
-// identical results. runMemory runs it in-process; runDist runs it on iii (durable
-// queue + atomic state). Requires ex-executor.ts running.
+// ex-differential.ts — one typed program, two interpreters. Test 1: the happy path is
+// byte-identical. Test 2: a failing task surfaces a failure under BOTH (neither hangs nor
+// throws) — the error *shapes* differ honestly (runMemory = raw cause; runDist = aggregated).
+// Requires ex-executor.ts running.
 
-import { flatMap, forEachPar, map } from "./effect";
+import { flatMap, forEachTask, map } from "./effect";
 import { runDist, runMemory } from "./interpret";
 import { makeIIIBackend } from "./runtime-iii";
-import { lengthOf, upper } from "./tasks";
+import { flaky, lengthOf, upper } from "./tasks";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const items = ["alpha", "bravo", "charlie", "delta", "echo"];
+const sig = new AbortController().signal;
 
-// ONE description, built from typed combinators:
-//   fan-out uppercase (conc 3) -> fan-out length of each (conc 2) -> fold to a summary
-const program = flatMap(
-  forEachPar(items, (s) => upper.effect(s), 3),
+// happy path: fan-out uppercase (conc 3) -> fan-out length (conc 2) -> fold to a summary
+const happy = flatMap(
+  forEachTask(["alpha", "bravo", "charlie", "delta", "echo"], upper, 3),
   (uppers) =>
-    map(
-      forEachPar(uppers, (s) => lengthOf.effect(s), 2),
-      (lens) => ({ uppers, totalLen: lens.reduce((a, b) => a + b, 0) }),
-    ),
+    map(forEachTask(uppers, lengthOf, 2), (lens) => ({ uppers, totalLen: lens.reduce((a, b) => a + b, 0) })),
 );
+
+// failure path: one task throws
+const failing = forEachTask(["fine", "boom", "ok"], flaky, 2);
 
 console.log("connecting to engine...");
 await sleep(1500);
-const sig = new AbortController().signal;
-
-console.log("running the SAME program under both interpreters...\n");
-const tM = Date.now();
-const m = await runMemory(program, {}, sig);
-const memMs = Date.now() - tM;
-
 const be = makeIIIBackend();
-const tD = Date.now();
-const d = await runDist(program, {}, be, sig);
-const distMs = Date.now() - tD;
 
-console.log("runMemory:", JSON.stringify(m));
-console.log("runDist  :", JSON.stringify(d));
+console.log("\n[1] happy path — same program under both interpreters:");
+const m1 = await runMemory(happy, {}, sig);
+const d1 = await runDist(happy, {}, be, sig);
+console.log("    runMemory:", JSON.stringify(m1));
+console.log("    runDist  :", JSON.stringify(d1));
+const identical = m1.ok && d1.ok && JSON.stringify(m1) === JSON.stringify(d1);
+console.log(`    => ${identical ? "IDENTICAL ✅" : "MISMATCH ❌"}`);
 
-const identical = m.ok && d.ok && JSON.stringify(m) === JSON.stringify(d);
-console.log(
-  `\nequivalence: ${identical ? "IDENTICAL ✅  — one program, two backends, same result" : "MISMATCH ❌"}`,
-);
-console.log(`timing: runMemory ${memMs}ms · runDist ${distMs}ms (iii pays the durable-queue + WS tax)`);
-process.exit(identical ? 0 : 1);
+console.log("\n[2] failure path — a throwing task is surfaced (not hung, not unhandled):");
+const m2 = await runMemory(failing, {}, sig);
+const d2 = await runDist(failing, {}, be, sig);
+console.log("    runMemory:", m2.ok ? "ok" : `fail(${String((m2.error as Error)?.message ?? m2.error)})`);
+console.log("    runDist  :", d2.ok ? "ok" : `fail(${String((d2.error as Error)?.message ?? d2.error)})`);
+const bothFailed = !m2.ok && !d2.ok;
+console.log(`    => both surfaced a typed failure: ${bothFailed ? "YES ✅ (shapes differ by design)" : "NO ❌"}`);
+
+const pass = identical && bothFailed;
+console.log(`\noverall: ${pass ? "PASS ✅" : "FAIL ❌"}`);
+process.exit(pass ? 0 : 1);

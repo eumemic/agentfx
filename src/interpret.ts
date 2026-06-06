@@ -1,13 +1,14 @@
 // interpret.ts — two interpreters over the SAME reified Effect tree.
 //
 //   runMemory : pure, in-process. Remote runs its local impl; Par is a promise pool.
-//   runDist   : backend-agnostic. Remote/Par are discharged through a `Backend`
-//               (the iii implementation lives in runtime-iii.ts). Everything else
-//               runs in the driver process.
+//   runDist   : backend-agnostic. Remote/Par discharge through a `Backend` (iii impl in
+//               runtime-iii.ts); everything else runs in the driver process.
 //
-// The point: one typed program, two interpreters, identical results (see ex-differential.ts).
+// Both funnel thrown/rejected impls into the typed `fail()` channel, so a throwing task
+// never escapes as an unhandled rejection. They agree on results (see ex-differential.ts),
+// including the failure path.
 
-import { type Effect, type Result, fail, ok } from "./effect";
+import { type Effect, type Result, Interrupted, fail, ok } from "./effect";
 
 const assertNever = (x: never): never => {
   throw new Error(`unhandled effect node: ${JSON.stringify(x)}`);
@@ -27,9 +28,17 @@ export async function runMemory<R, E, A>(
     case "Fail":
       return fail(e.error);
     case "Suspend":
-      return e.thunk(env, signal);
+      try {
+        return await e.thunk(env, signal);
+      } catch (err) {
+        return fail(err as E);
+      }
     case "Remote":
-      return ok((await e.local(e.args)) as A);
+      try {
+        return ok((await e.local(e.args, { idempotencyKey: e.key })) as A);
+      } catch (err) {
+        return fail(err as E);
+      }
     case "Provide":
       return runMemory(e.effect, { ...e.layer, ...(env as object) } as unknown as R, signal) as Promise<
         Result<E, A>
@@ -37,6 +46,10 @@ export async function runMemory<R, E, A>(
     case "FlatMap": {
       const r = await runMemory(e.first, env, signal);
       return r.ok ? runMemory(e.f(r.value), env, signal) : (r as Result<E, A>);
+    }
+    case "CatchAll": {
+      const r = await runMemory(e.effect, env, signal);
+      return r.ok ? (r as Result<E, A>) : runMemory(e.handler(r.error), env, signal);
     }
     case "Retry": {
       let last: Result<E, A> = fail(undefined as unknown as E);
@@ -49,18 +62,24 @@ export async function runMemory<R, E, A>(
     case "Par": {
       const results: unknown[] = new Array(e.effects.length);
       const cursor = { next: 0 };
-      const box: { failure: Result<E, never> | null } = { failure: null };
+      const box: { failure: Result<E, never> | null; done: number } = { failure: null, done: 0 };
       const lanes = Math.min(Math.max(1, e.concurrency), e.effects.length || 1);
       const worker = async (): Promise<void> => {
         while (cursor.next < e.effects.length && box.failure === null && !signal.aborted) {
           const i = cursor.next++;
           const r = await runMemory(e.effects[i], env, signal);
-          if (r.ok) results[i] = r.value;
-          else box.failure = r as Result<E, never>;
+          if (r.ok) {
+            results[i] = r.value;
+            box.done++;
+          } else {
+            box.failure = r as Result<E, never>;
+          }
         }
       };
       await Promise.all(Array.from({ length: lanes }, worker));
-      return box.failure ?? ok(results as unknown as A);
+      if (box.failure) return box.failure;
+      if (box.done < e.effects.length) return fail(new Interrupted() as unknown as E); // aborted mid-flight
+      return ok(results as unknown as A);
     }
     default:
       return assertNever(e);
@@ -71,11 +90,14 @@ export async function runMemory<R, E, A>(
 // runDist — the distributing interpreter (backend pluggable)
 // ─────────────────────────────────────────────────────────────────────────
 export interface Backend {
-  /** Invoke a registered function on the runtime. */
+  /** Invoke a registered function on the runtime (non-durable direct call). */
   callRemote(fnId: string, args: unknown): Promise<unknown>;
-  /** Fan a batch of registered tasks across the runtime, bounded by the runtime's
-   *  own concurrency (a deployment setting), at-least-once + crash-surviving. */
-  parRemote(jobs: ReadonlyArray<{ fnId: string; args: unknown; key: string }>): Promise<unknown[]>;
+  /** Fan a batch of registered tasks across the runtime, bounded by `concurrency`,
+   *  at-least-once + crash-surviving. Rejects if any job ultimately fails. */
+  parRemote(
+    jobs: ReadonlyArray<{ fnId: string; args: unknown; key: string }>,
+    concurrency: number,
+  ): Promise<unknown[]>;
 }
 
 export async function runDist<R, E, A>(
@@ -90,9 +112,17 @@ export async function runDist<R, E, A>(
     case "Fail":
       return fail(e.error);
     case "Suspend":
-      return e.thunk(env, signal); // local-only node: runs in the driver
+      try {
+        return await e.thunk(env, signal);
+      } catch (err) {
+        return fail(err as E);
+      }
     case "Remote":
-      return ok((await be.callRemote(e.fnId, e.args)) as A);
+      try {
+        return ok((await be.callRemote(e.fnId, e.args)) as A);
+      } catch (err) {
+        return fail(err as E);
+      }
     case "Provide":
       return runDist(e.effect, { ...e.layer, ...(env as object) } as unknown as R, be, signal) as Promise<
         Result<E, A>
@@ -100,6 +130,10 @@ export async function runDist<R, E, A>(
     case "FlatMap": {
       const r = await runDist(e.first, env, be, signal);
       return r.ok ? runDist(e.f(r.value), env, be, signal) : (r as Result<E, A>);
+    }
+    case "CatchAll": {
+      const r = await runDist(e.effect, env, be, signal);
+      return r.ok ? (r as Result<E, A>) : runDist(e.handler(r.error), env, be, signal);
     }
     case "Retry": {
       let last: Result<E, A> = fail(undefined as unknown as E);
@@ -110,18 +144,21 @@ export async function runDist<R, E, A>(
       return last;
     }
     case "Par": {
-      // Distribution requires serializable units — closures don't ship over a queue.
+      // Distribution needs serializable units. A non-task child is programmer error — fail loud.
       const jobs = e.effects.map((child) => {
         if (child._tag !== "Remote") {
           throw new Error(
-            "runDist can only distribute Par over `task` (Remote) effects — closures do not serialize. " +
-              "Wrap the work in task(fnId, keyOf, impl).",
+            "runDist can only distribute Par over `task` effects — closures don't serialize. Use forEachTask(items, taskDef, n).",
           );
         }
         return { fnId: child.fnId, args: child.args, key: child.key };
       });
-      const results = await be.parRemote(jobs);
-      return ok(results as unknown as A);
+      try {
+        const results = await be.parRemote(jobs, e.concurrency);
+        return ok(results as unknown as A);
+      } catch (err) {
+        return fail(err as E);
+      }
     }
     default:
       return assertNever(e);

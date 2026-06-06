@@ -1,13 +1,21 @@
 {
   "name": "agentfx",
   "version": "0.1.0",
-  "private": true,
-  "description": "A typed effect system whose production interpreter is a durable distributed runtime (iii). One program, two interpreters, proven equivalent.",
-  "keywords": ["effect-system", "typescript", "agents", "durable", "iii", "rxjs", "interpreter"],
+  "description": "A typed effect system whose production interpreter is a durable distributed runtime (iii). One program, two interpreters, differentially tested.",
+  "keywords": ["effect-system", "typescript", "agents", "durable", "iii", "interpreter", "at-least-once"],
   "license": "MIT",
   "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "files": ["src/effect.ts", "src/interpret.ts", "src/runtime-iii.ts", "src/index.ts", "README.md", "LICENSE"],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit",
     "executor": "tsx src/ex-executor.ts",
     "differential": "tsx src/ex-differential.ts",
     "durability": "tsx src/ex-durability.ts",

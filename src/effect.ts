@@ -1,17 +1,12 @@
-// effect.ts — a REIFIED typed effect tree.
+// effect.ts — a REIFIED typed effect tree (data, not thunks), so multiple interpreters
+// can walk the same program: `runMemory` (in-process) and `runDist` (a durable runtime).
 //
-// Unlike a final/thunk encoding (where combinators execute inline), an Effect here
-// is a *data structure* describing a computation. That lets multiple interpreters
-// walk the same tree and discharge it differently — `runMemory` (in-process) and
-// `runIII` (a durable distributed runtime). See interpret.ts.
+// Type laws enforced by the compiler (see test/laws.ts):
+//   • capability tracking — cannot run without supplying R
+//   • the Replayable brand — cannot `retry` a non-idempotent effect
 //
-// Two type laws survive the refactor (proven in laws.ts):
-//   • capability tracking — you cannot run an Effect without supplying its R
-//   • the Replayable brand — you cannot `retry` a non-idempotent Effect
-//
-// TS has no GADTs, so a reified tree must ERASE the intermediate types in FlatMap
-// and the element types in Par. We contain that erasure to the constructors below
-// (each marked); the public API stays fully typed.
+// TS has no GADTs, so a reified tree erases intermediate types (FlatMap, Par, CatchAll).
+// That erasure is contained to the constructors below; the public API stays typed.
 
 export type Result<E, A> =
   | { readonly ok: true; readonly value: A }
@@ -20,13 +15,26 @@ export type Result<E, A> =
 export const ok = <A>(value: A): Result<never, A> => ({ ok: true, value });
 export const fail = <E>(error: E): Result<E, never> => ({ ok: false, error });
 
+/** Returned when an effect is aborted via its AbortSignal. */
+export class Interrupted extends Error {
+  constructor() {
+    super("effect interrupted");
+    this.name = "Interrupted";
+  }
+}
+
 declare const ReplayableTag: unique symbol;
 /** Phantom evidence that an effect is safe to re-run. Only `task(...)` mints it. */
 export interface Replayable {
   readonly [ReplayableTag]: true;
 }
 
-// --- the reified nodes (A and E are phantom on the union; carried by constructors) ---
+/** Context handed to a task impl. `idempotencyKey` is derived from the task's args and is
+ *  stable across retries/redeliveries — pass it to external providers for exactly-once. */
+export interface TaskCtx {
+  readonly idempotencyKey: string;
+}
+
 export type Effect<R, E, A> =
   | { readonly _tag: "Succeed"; readonly value: A }
   | { readonly _tag: "Fail"; readonly error: E }
@@ -35,30 +43,21 @@ export type Effect<R, E, A> =
       readonly thunk: (env: R, signal: AbortSignal) => Promise<Result<E, A>>;
       readonly label?: string;
     }
-  // A distributable leaf: a registered function id + serializable args + dedup key.
-  // Closures don't cross a queue, so distribution is only ever over these.
   | {
       readonly _tag: "Remote";
       readonly fnId: string;
       readonly args: unknown;
       readonly key: string;
-      readonly local: (args: unknown) => Promise<unknown>; // for runMemory
+      readonly local: (args: unknown, ctx: TaskCtx) => Promise<unknown>;
     }
-  | {
-      readonly _tag: "FlatMap";
-      readonly first: Effect<R, E, unknown>; // intermediate type erased
-      readonly f: (x: unknown) => Effect<R, E, A>;
-    }
-  | {
-      readonly _tag: "Par";
-      readonly effects: ReadonlyArray<Effect<R, E, unknown>>; // element type erased; A = unknown[]
-      readonly concurrency: number;
-    }
+  | { readonly _tag: "FlatMap"; readonly first: Effect<R, E, unknown>; readonly f: (x: unknown) => Effect<R, E, A> }
+  | { readonly _tag: "Par"; readonly effects: ReadonlyArray<Effect<R, E, unknown>>; readonly concurrency: number }
   | { readonly _tag: "Retry"; readonly effect: Effect<R, E, A>; readonly times: number }
+  | { readonly _tag: "Provide"; readonly layer: Record<string, unknown>; readonly effect: Effect<unknown, E, A> }
   | {
-      readonly _tag: "Provide";
-      readonly layer: Record<string, unknown>;
-      readonly effect: Effect<unknown, E, A>;
+      readonly _tag: "CatchAll";
+      readonly effect: Effect<R, unknown, A>;
+      readonly handler: (error: unknown) => Effect<R, E, A>;
     };
 
 // --- constructors (the only place the erasure casts live) ----------------
@@ -82,6 +81,16 @@ export const flatMap = <R, E, A, R2, E2, B>(
 export const map = <R, E, A, B>(e: Effect<R, E, A>, f: (a: A) => B): Effect<R, E, B> =>
   flatMap(e, (a) => succeed(f(a)));
 
+/** Recover from a typed failure with another effect. The recovery path may narrow E. */
+export const catchAll = <R, E, A, E2>(
+  e: Effect<R, E, A>,
+  handler: (error: E) => Effect<R, E2, A>,
+): Effect<R, E2, A> => ({
+  _tag: "CatchAll",
+  effect: e as unknown as Effect<R, unknown, A>,
+  handler: handler as unknown as (error: unknown) => Effect<R, E2, A>,
+});
+
 /** retry ONLY accepts Replayable effects — re-running a non-idempotent effect is a TYPE ERROR. */
 export const retry = <R, E, A>(
   e: Effect<R, E, A> & Replayable,
@@ -89,8 +98,9 @@ export const retry = <R, E, A>(
 ): Effect<R, E, A> & Replayable =>
   ({ _tag: "Retry", effect: e, times }) as unknown as Effect<R, E, A> & Replayable;
 
-/** forEachPar: bounded-concurrency fan-out. In-memory it is a promise pool; lowered
- *  to iii it is a durable queue (children must be `task` Remotes — closures don't ship). */
+/** Generic bounded-concurrency fan-out. Under runMemory it's a promise pool; under runDist
+ *  every child MUST be a `task` (Remote) — closures don't serialize. For a *type-safe*
+ *  distributable fan-out, prefer `forEachTask`. */
 export const forEachPar = <R, E, A, B>(
   items: readonly A[],
   f: (a: A) => Effect<R, E, B>,
@@ -102,32 +112,46 @@ export const forEachPar = <R, E, A, B>(
     concurrency,
   }) as unknown as Effect<R, E, B[]>;
 
-export const provide = <R, P extends Partial<R>, E, A>(
+/** Type-safe distributable fan-out: takes a TaskDef, so children are guaranteed Remote and
+ *  this runs identically (results-wise) under both interpreters. */
+export const forEachTask = <In, Out, E>(
+  items: readonly In[],
+  t: TaskDef<In, Out, E>,
+  concurrency: number,
+): Effect<unknown, E, Out[]> =>
+  ({
+    _tag: "Par",
+    effects: items.map((i) => t.effect(i)) as unknown as ReadonlyArray<Effect<unknown, E, unknown>>,
+    concurrency,
+  }) as unknown as Effect<unknown, E, Out[]>;
+
+/** Discharge capabilities. `Pick<R,K>` rejects keys that aren't in R (a typo is a type error). */
+export const provide = <R, K extends keyof R, E, A>(
   e: Effect<R, E, A>,
-  layer: P,
-): Effect<Omit<R, keyof P>, E, A> =>
+  layer: Pick<R, K>,
+): Effect<Omit<R, K>, E, A> =>
   ({
     _tag: "Provide",
     layer: layer as Record<string, unknown>,
     effect: e as unknown as Effect<unknown, E, A>,
-  }) as unknown as Effect<Omit<R, keyof P>, E, A>;
+  }) as unknown as Effect<Omit<R, K>, E, A>;
 
 // --- tasks: the distributable, idempotent unit ---------------------------
-export interface TaskDef<In, Out> {
+export interface TaskDef<In, Out, E = unknown> {
   readonly fnId: string;
   readonly keyOf: (input: In) => string;
-  readonly impl: (input: In) => Promise<Out>;
-  /** Build the (Replayable) effect node for one input. */
-  readonly effect: (input: In) => Effect<unknown, never, Out> & Replayable;
+  readonly impl: (input: In, ctx: TaskCtx) => Promise<Out>;
+  readonly effect: (input: In) => Effect<unknown, E, Out> & Replayable;
 }
 
-/** Define a distributable task: a named, idempotent function. Its effect is Replayable
- *  (safe to retry) and runs locally under runMemory or on the engine under runIII. */
-export const task = <In, Out>(
+/** Define a distributable task: a named function with a derived idempotency key. Its effect
+ *  is Replayable (safe to retry). A thrown error is funneled into the typed E channel by the
+ *  interpreter (E defaults to `unknown` — the thrown value; narrow it with `catchAll`). */
+export const task = <In, Out, E = unknown>(
   fnId: string,
   keyOf: (input: In) => string,
-  impl: (input: In) => Promise<Out>,
-): TaskDef<In, Out> => ({
+  impl: (input: In, ctx: TaskCtx) => Promise<Out>,
+): TaskDef<In, Out, E> => ({
   fnId,
   keyOf,
   impl,
@@ -137,6 +161,6 @@ export const task = <In, Out>(
       fnId,
       args: input,
       key: keyOf(input),
-      local: impl as (args: unknown) => Promise<unknown>,
-    }) as unknown as Effect<unknown, never, Out> & Replayable,
+      local: impl as (args: unknown, ctx: TaskCtx) => Promise<unknown>,
+    }) as unknown as Effect<unknown, E, Out> & Replayable,
 });

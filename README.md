@@ -7,6 +7,17 @@ it in-process — great for tests. A *distributing* interpreter (`runDist`) runs
 on [iii](https://iii.dev): an at-least-once durable queue with atomic state, so it survives
 process death. The two are differentially tested.
 
+```mermaid
+flowchart TD
+  prog["one typed program — the Effect algebra"]
+  prog --> walk["walk · one reified tree, one interpreter core"]
+  walk -->|runMemory| mem["in-process promise pool<br/>fast · for tests"]
+  walk -->|runDist| dist["iii backend"]
+  dist --> q["durable queue<br/>at-least-once · DLQ · survives kill -9"]
+  dist --> st["atomic state<br/>idempotent claim-once"]
+  mem -.->|"differentially tested: identical results"| dist
+```
+
 The thesis in a line: **a typed effect algebra on top, a durable runtime underneath, and the
 boundary between "elegant" and "durable" is the interpreter** — a fan-out that survives a
 `kill -9`, which a pure in-memory `Observable` never could.

@@ -1,7 +1,6 @@
 // tasks.ts — example distributable tasks shared by the demos.
 import { task } from "./effect";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+import { sleep } from "./util";
 
 /** Uppercase (≈400ms). Idempotent: key = the input. ctx.idempotencyKey is available for
  *  real side-effecting tasks to dedupe at their provider (unused here — pure). */

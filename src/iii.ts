@@ -5,14 +5,14 @@
 // AND records the commit marker in the same linearized critical section.
 
 import { registerWorker } from "iii-sdk";
+import { trigger } from "./util";
 
 const worker = registerWorker(process.env.III_URL ?? "ws://localhost:49134", {
   workerName: "agentfx",
 });
 
 const SCOPE = "agentfx";
-const call = (function_id: string, payload: unknown): Promise<any> =>
-  worker.trigger({ function_id, payload }) as Promise<any>;
+const call = (fn: string, payload: unknown): Promise<any> => trigger(worker, fn, payload);
 
 export const resetAgent = (agentId: string): Promise<unknown> =>
   call("state::delete", { scope: SCOPE, key: agentId });

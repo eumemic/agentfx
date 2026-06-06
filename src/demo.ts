@@ -9,9 +9,9 @@
 //      NOT depend on cancellation; it lives at the side-effect boundary.
 
 import { bumpGen, fence, fireTool, readState, resetAgent } from "./iii";
+import { sleep } from "./util";
 
 const AGENT = "agent-7";
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Simulated "react" step: after llmMs the model proposes a tool call.
  *  If cancellable, an abort resolves early to 'aborted'; if not, it ignores abort. */

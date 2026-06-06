@@ -6,8 +6,7 @@ import { forEachTask } from "./effect";
 import { runDist } from "./interpret";
 import { makeIIIBackend } from "./runtime-iii";
 import { upper } from "./tasks";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+import { sleep } from "./util";
 const items = Array.from({ length: 12 }, (_, i) => `task-${i}`);
 
 console.log("connecting to engine...");

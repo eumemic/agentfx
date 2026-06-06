@@ -1,27 +1,47 @@
-// interpret.ts — two interpreters over the SAME reified Effect tree.
+// interpret.ts — ONE tree-walk, two strategies.
 //
-//   runMemory : pure, in-process. Remote runs its local impl; Par is a promise pool.
-//   runDist   : backend-agnostic. Remote/Par discharge through a `Backend` (iii impl in
-//               runtime-iii.ts); everything else runs in the driver process.
+// The reified Effect tree is walked by `walk`, which handles every structural node
+// (Succeed/Fail/Suspend/FlatMap/CatchAll/Retry/Provide) once. The two interpreters differ
+// only in how the two genuinely-different leaves discharge — `Remote` and `Par`:
 //
-// Both funnel thrown/rejected impls into the typed `fail()` channel, so a throwing task
-// never escapes as an unhandled rejection. They agree on results (see ex-differential.ts),
-// including the failure path.
+//   runMemory : Remote runs its local impl; Par is an in-process promise pool.
+//   runDist   : Remote/Par go through a `Backend` (the iii impl in runtime-iii.ts).
+//
+// Because the shared cases live in one place, the two interpreters can't drift — which is
+// exactly the invariant ex-differential.ts checks. Both funnel a thrown impl into fail().
 
-import { type Effect, type Result, Interrupted, fail, ok } from "./effect";
+import { type Effect, type Result, type TaskCtx, Interrupted, fail, ok } from "./effect";
 
 const assertNever = (x: never): never => {
   throw new Error(`unhandled effect node: ${JSON.stringify(x)}`);
 };
 
-// ─────────────────────────────────────────────────────────────────────────
-// runMemory — the reference interpreter
-// ─────────────────────────────────────────────────────────────────────────
-export async function runMemory<R, E, A>(
+type Run<E> = <A>(e: Effect<unknown, E, A>, env: unknown, signal: AbortSignal) => Promise<Result<E, A>>;
+
+/** How an interpreter discharges the two leaves that actually differ. */
+interface Interp<E> {
+  remote(node: {
+    fnId: string;
+    args: unknown;
+    key: string;
+    local: (args: unknown, ctx: TaskCtx) => Promise<unknown>;
+  }): Promise<Result<E, unknown>>;
+  par(
+    // R is contravariant and the strategies don't read env's type — accept any node shape.
+    node: { effects: ReadonlyArray<Effect<any, E, unknown>>; concurrency: number },
+    env: unknown,
+    signal: AbortSignal,
+    run: Run<E>,
+  ): Promise<Result<E, unknown[]>>;
+}
+
+async function walk<R, E, A>(
   e: Effect<R, E, A>,
   env: R,
-  signal: AbortSignal = new AbortController().signal,
+  signal: AbortSignal,
+  interp: Interp<E>,
 ): Promise<Result<E, A>> {
+  const run: Run<E> = (ee, en, sig) => walk(ee, en, sig, interp);
   switch (e._tag) {
     case "Succeed":
       return ok(e.value);
@@ -34,61 +54,70 @@ export async function runMemory<R, E, A>(
         return fail(err as E);
       }
     case "Remote":
-      try {
-        return ok((await e.local(e.args, { idempotencyKey: e.key })) as A);
-      } catch (err) {
-        return fail(err as E);
-      }
+      return interp.remote(e) as Promise<Result<E, A>>;
+    case "Par":
+      return interp.par(e, env, signal, run) as Promise<Result<E, A>>;
     case "Provide":
-      return runMemory(e.effect, { ...e.layer, ...(env as object) } as unknown as R, signal) as Promise<
+      return walk(e.effect, { ...e.layer, ...(env as object) } as unknown as R, signal, interp) as Promise<
         Result<E, A>
       >;
     case "FlatMap": {
-      const r = await runMemory(e.first, env, signal);
-      return r.ok ? runMemory(e.f(r.value), env, signal) : (r as Result<E, A>);
+      const r = await walk(e.first, env, signal, interp);
+      return r.ok ? walk(e.f(r.value), env, signal, interp) : (r as Result<E, A>);
     }
     case "CatchAll": {
-      const r = await runMemory(e.effect, env, signal);
-      return r.ok ? (r as Result<E, A>) : runMemory(e.handler(r.error), env, signal);
+      const r = await walk(e.effect, env, signal, interp);
+      return r.ok ? (r as Result<E, A>) : walk(e.handler(r.error), env, signal, interp);
     }
     case "Retry": {
-      let last: Result<E, A> = fail(undefined as unknown as E);
+      let last: Result<E, A> | undefined;
       for (let i = 0; i <= e.times && !signal.aborted; i++) {
-        last = await runMemory(e.effect, env, signal);
+        last = await walk(e.effect, env, signal, interp);
         if (last.ok) return last;
       }
-      return last;
-    }
-    case "Par": {
-      const results: unknown[] = new Array(e.effects.length);
-      const cursor = { next: 0 };
-      const box: { failure: Result<E, never> | null; done: number } = { failure: null, done: 0 };
-      const lanes = Math.min(Math.max(1, e.concurrency), e.effects.length || 1);
-      const worker = async (): Promise<void> => {
-        while (cursor.next < e.effects.length && box.failure === null && !signal.aborted) {
-          const i = cursor.next++;
-          const r = await runMemory(e.effects[i], env, signal);
-          if (r.ok) {
-            results[i] = r.value;
-            box.done++;
-          } else {
-            box.failure = r as Result<E, never>;
-          }
-        }
-      };
-      await Promise.all(Array.from({ length: lanes }, worker));
-      if (box.failure) return box.failure;
-      if (box.done < e.effects.length) return fail(new Interrupted() as unknown as E); // aborted mid-flight
-      return ok(results as unknown as A);
+      return last ?? fail(new Interrupted() as unknown as E); // only reached if pre-aborted
     }
     default:
       return assertNever(e);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// runDist — the distributing interpreter (backend pluggable)
-// ─────────────────────────────────────────────────────────────────────────
+// ── runMemory: the reference strategy ──────────────────────────────────────
+export function runMemory<R, E, A>(
+  e: Effect<R, E, A>,
+  env: R,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<Result<E, A>> {
+  return walk(e, env, signal, {
+    async remote(node) {
+      try {
+        return ok(await node.local(node.args, { idempotencyKey: node.key }));
+      } catch (err) {
+        return fail(err as E);
+      }
+    },
+    async par(node, penv, psig, prun) {
+      const results: unknown[] = new Array(node.effects.length);
+      let next = 0;
+      let failure: Result<E, never> | null = null;
+      const lanes = Math.max(1, Math.min(node.concurrency, node.effects.length || 1));
+      const lane = async (): Promise<void> => {
+        while (next < node.effects.length && failure === null && !psig.aborted) {
+          const i = next++;
+          const r = await prun(node.effects[i], penv, psig);
+          if (r.ok) results[i] = r.value;
+          else failure = r as Result<E, never>;
+        }
+      };
+      await Promise.all(Array.from({ length: lanes }, lane));
+      if (failure) return failure;
+      if (next < node.effects.length) return fail(new Interrupted() as unknown as E); // aborted mid-flight
+      return ok(results);
+    },
+  });
+}
+
+// ── runDist: the distributing strategy (backend pluggable) ─────────────────
 export interface Backend {
   /** Invoke a registered function on the runtime (non-durable direct call). */
   callRemote(fnId: string, args: unknown): Promise<unknown>;
@@ -100,52 +129,23 @@ export interface Backend {
   ): Promise<unknown[]>;
 }
 
-export async function runDist<R, E, A>(
+export function runDist<R, E, A>(
   e: Effect<R, E, A>,
   env: R,
   be: Backend,
   signal: AbortSignal = new AbortController().signal,
 ): Promise<Result<E, A>> {
-  switch (e._tag) {
-    case "Succeed":
-      return ok(e.value);
-    case "Fail":
-      return fail(e.error);
-    case "Suspend":
+  return walk(e, env, signal, {
+    async remote(node) {
       try {
-        return await e.thunk(env, signal);
+        return ok(await be.callRemote(node.fnId, node.args));
       } catch (err) {
         return fail(err as E);
       }
-    case "Remote":
-      try {
-        return ok((await be.callRemote(e.fnId, e.args)) as A);
-      } catch (err) {
-        return fail(err as E);
-      }
-    case "Provide":
-      return runDist(e.effect, { ...e.layer, ...(env as object) } as unknown as R, be, signal) as Promise<
-        Result<E, A>
-      >;
-    case "FlatMap": {
-      const r = await runDist(e.first, env, be, signal);
-      return r.ok ? runDist(e.f(r.value), env, be, signal) : (r as Result<E, A>);
-    }
-    case "CatchAll": {
-      const r = await runDist(e.effect, env, be, signal);
-      return r.ok ? (r as Result<E, A>) : runDist(e.handler(r.error), env, be, signal);
-    }
-    case "Retry": {
-      let last: Result<E, A> = fail(undefined as unknown as E);
-      for (let i = 0; i <= e.times && !signal.aborted; i++) {
-        last = await runDist(e.effect, env, be, signal);
-        if (last.ok) return last;
-      }
-      return last;
-    }
-    case "Par": {
+    },
+    async par(node) {
       // Distribution needs serializable units. A non-task child is programmer error — fail loud.
-      const jobs = e.effects.map((child) => {
+      const jobs = node.effects.map((child) => {
         if (child._tag !== "Remote") {
           throw new Error(
             "runDist can only distribute Par over `task` effects — closures don't serialize. Use forEachTask(items, taskDef, n).",
@@ -154,13 +154,10 @@ export async function runDist<R, E, A>(
         return { fnId: child.fnId, args: child.args, key: child.key };
       });
       try {
-        const results = await be.parRemote(jobs, e.concurrency);
-        return ok(results as unknown as A);
+        return ok(await be.parRemote(jobs, node.concurrency));
       } catch (err) {
         return fail(err as E);
       }
-    }
-    default:
-      return assertNever(e);
-  }
+    },
+  });
 }

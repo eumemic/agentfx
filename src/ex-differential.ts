@@ -7,8 +7,8 @@ import { flatMap, forEachTask, map } from "./effect";
 import { runDist, runMemory } from "./interpret";
 import { makeIIIBackend } from "./runtime-iii";
 import { flaky, lengthOf, upper } from "./tasks";
+import { sleep } from "./util";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sig = new AbortController().signal;
 
 // happy path: fan-out uppercase (conc 3) -> fan-out length (conc 2) -> fold to a summary
@@ -26,16 +26,14 @@ await sleep(1500);
 const be = makeIIIBackend();
 
 console.log("\n[1] happy path — same program under both interpreters:");
-const m1 = await runMemory(happy, {}, sig);
-const d1 = await runDist(happy, {}, be, sig);
+const [m1, d1] = await Promise.all([runMemory(happy, {}, sig), runDist(happy, {}, be, sig)]);
 console.log("    runMemory:", JSON.stringify(m1));
 console.log("    runDist  :", JSON.stringify(d1));
 const identical = m1.ok && d1.ok && JSON.stringify(m1) === JSON.stringify(d1);
 console.log(`    => ${identical ? "IDENTICAL ✅" : "MISMATCH ❌"}`);
 
 console.log("\n[2] failure path — a throwing task is surfaced (not hung, not unhandled):");
-const m2 = await runMemory(failing, {}, sig);
-const d2 = await runDist(failing, {}, be, sig);
+const [m2, d2] = await Promise.all([runMemory(failing, {}, sig), runDist(failing, {}, be, sig)]);
 console.log("    runMemory:", m2.ok ? "ok" : `fail(${String((m2.error as Error)?.message ?? m2.error)})`);
 console.log("    runDist  :", d2.ok ? "ok" : `fail(${String((d2.error as Error)?.message ?? d2.error)})`);
 const bothFailed = !m2.ok && !d2.ok;

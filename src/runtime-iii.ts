@@ -4,6 +4,7 @@
 import { registerWorker } from "iii-sdk";
 import type { Backend } from "./interpret";
 import type { TaskDef } from "./effect";
+import { sleep, trigger } from "./util";
 
 const URL = process.env.III_URL ?? "ws://localhost:49134";
 // Single namespace — all worker names, the batch topic, the state scope, and the executor
@@ -14,9 +15,6 @@ const SCOPE = `${NS}_batch`;
 const EXEC_FN = `${NS}::exec`;
 
 type Worker = ReturnType<typeof registerWorker>;
-const trig = (w: Worker, fnId: string, payload: unknown): Promise<any> =>
-  w.trigger({ function_id: fnId, payload }) as Promise<any>;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface BatchState {
   results?: Record<string, unknown>;
@@ -24,35 +22,40 @@ interface BatchState {
   done?: Record<string, "ok" | "err">;
 }
 
+const getBatch = async (w: Worker, batchId: string): Promise<BatchState> =>
+  (await trigger(w, "state::get", { scope: SCOPE, key: batchId })) ?? {};
+
 // ── Driver-side Backend ───────────────────────────────────────────────────
 export function makeIIIBackend(): Backend & { close: () => void } {
   const w = registerWorker(URL, { workerName: `${NS}-driver` });
 
   return {
     async callRemote(fnId, args) {
-      return trig(w, fnId, args);
+      return trigger(w, fnId, args);
     },
 
-    // Wave-based fan-out: at most `concurrency` jobs in flight, so runDist honors the
-    // Par's concurrency the same way runMemory's pool does. Surfaces failures (no 60s hang).
+    // Wave-based fan-out: at most `concurrency` jobs in flight, so runDist honors the Par's
+    // concurrency the same way runMemory's pool does. Surfaces failures (no silent 60s hang).
     async parRemote(jobs, concurrency) {
       const batchId = crypto.randomUUID();
-      await trig(w, "state::delete", { scope: SCOPE, key: batchId });
+      await trigger(w, "state::delete", { scope: SCOPE, key: batchId });
       const conc = Math.max(1, concurrency);
+      let st: BatchState = {};
 
       for (let start = 0; start < jobs.length; start += conc) {
         const chunk = jobs.slice(start, start + conc);
-        for (let k = 0; k < chunk.length; k++) {
-          const j = chunk[k];
-          await trig(w, "iii::durable::publish", {
-            topic: BATCH_TOPIC,
-            data: { batchId, idx: start + k, fnId: j.fnId, args: j.args, key: j.key },
-          });
-        }
+        await Promise.all(
+          chunk.map((j, k) =>
+            trigger(w, "iii::durable::publish", {
+              topic: BATCH_TOPIC,
+              data: { batchId, idx: start + k, fnId: j.fnId, args: j.args, key: j.key },
+            }),
+          ),
+        );
         const wantIdx = chunk.map((_, k) => String(start + k));
         const deadline = Date.now() + 60_000;
         for (;;) {
-          const st: BatchState = (await trig(w, "state::get", { scope: SCOPE, key: batchId })) ?? {};
+          st = await getBatch(w, batchId);
           const done = st.done ?? {};
           if (wantIdx.every((i) => done[i] !== undefined)) break;
           if (Date.now() > deadline) throw new Error(`parRemote ${batchId} timed out at chunk @${start}`);
@@ -60,7 +63,7 @@ export function makeIIIBackend(): Backend & { close: () => void } {
         }
       }
 
-      const st: BatchState = (await trig(w, "state::get", { scope: SCOPE, key: batchId })) ?? {};
+      // `st` holds the final poll's snapshot (state is cumulative) — no extra round-trip.
       const done = st.done ?? {};
       const errors = st.errors ?? {};
       const results = st.results ?? {};
@@ -90,9 +93,8 @@ export function startExecutor(tasks: ReadonlyArray<TaskDef<any, any, any>>, opts
   const log = opts.onEvent ?? ((m: string) => console.log(m));
   const w = registerWorker(URL, { workerName: `${NS}-executor` });
 
-  const impls = new Map<string, TaskDef<any, any, any>["impl"]>();
+  const impls = new Map(tasks.map((t) => [t.fnId, t.impl] as const));
   for (const t of tasks) {
-    impls.set(t.fnId, t.impl);
     w.registerFunction(t.fnId, ((payload: unknown) => t.impl(payload, { idempotencyKey: t.keyOf(payload as any) })) as unknown as (
       p: unknown,
     ) => Promise<unknown>);
@@ -105,10 +107,9 @@ export function startExecutor(tasks: ReadonlyArray<TaskDef<any, any, any>>, opts
       const impl = impls.get(fnId);
       if (!impl) throw new Error(`no task registered for fnId=${fnId}`);
 
-      // idempotent: skip a job whose slot is already finished (redelivery of a completed job).
-      // A job that crashed mid-flight left no `done` marker, so it re-runs — that's the
-      // at-least-once recovery. (Exactly-once external effects still need the idempotencyKey.)
-      const cur: BatchState = (await trig(w, "state::get", { scope: SCOPE, key: batchId })) ?? {};
+      // idempotent: skip a job whose slot already finished (redelivery of a completed job). A
+      // job that crashed mid-flight left no `done` marker, so it re-runs — at-least-once recovery.
+      const cur = await getBatch(w, batchId);
       if ((cur.done ?? {})[String(idx)] !== undefined) {
         log(`[exec] ↩ ${fnId}[${idx}] already done — skip`);
         return null;
@@ -116,7 +117,7 @@ export function startExecutor(tasks: ReadonlyArray<TaskDef<any, any, any>>, opts
 
       try {
         const result = await impl(args, { idempotencyKey: key });
-        await trig(w, "state::update", {
+        await trigger(w, "state::update", {
           scope: SCOPE,
           key: batchId,
           ops: [
@@ -126,7 +127,7 @@ export function startExecutor(tasks: ReadonlyArray<TaskDef<any, any, any>>, opts
         });
         log(`[exec] ✔ ${fnId}[${idx}]`);
       } catch (err) {
-        await trig(w, "state::update", {
+        await trigger(w, "state::update", {
           scope: SCOPE,
           key: batchId,
           ops: [

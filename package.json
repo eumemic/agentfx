@@ -30,6 +30,7 @@
     "src/gen.ts",
     "src/util.ts",
     "src/index.ts",
+    "src/harness",
     "README.md",
     "LICENSE"
   ],
@@ -45,7 +46,10 @@
     "remote": "tsx src/ex-remote.ts",
     "agent": "tsx src/ex-agent.ts",
     "preempt-agent": "tsx src/ex-preempt-agent.ts",
-    "preempt": "tsx src/demo.ts"
+    "preempt": "tsx src/demo.ts",
+    "harness:worker": "tsx src/harness-worker.ts",
+    "harness:durable": "tsx src/ex-harness-durable.ts",
+    "harness:claude": "tsx src/ex-harness-claude.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",

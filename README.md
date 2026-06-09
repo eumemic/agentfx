@@ -165,6 +165,59 @@ Needs `ANTHROPIC_API_KEY` (and optional `ANTHROPIC_BASE_URL`) plus the `pymath` 
 (`python pymath_worker.py`). The model call is non-streaming with adaptive thinking and an
 `AbortSignal` for preemption.
 
+## A durable agent loop (aios-style) — the loop IS the queue
+
+`ex-agent.ts` above runs the ReAct loop **in the driver** — a normal `for`-loop in one process.
+Kill that process mid-turn and the turn is gone. [`src/harness/`](src/harness/) re-expresses it the
+way [aios](https://github.com/eumemic/aios) does: **there is no loop.** An append-only event log is
+the source of truth, a step function is re-entered by durable wake jobs, and a driver crash mid-turn
+resumes from the log. The agent's reasoning loop itself is durable.
+
+| aios concept | here, on agentfx + iii |
+|---|---|
+| append-only session event log | per-event keys in file-backed `iii-state` ([`log.ts`](src/harness/log.ts)); monotonic seq via atomic `state::update increment` |
+| the "loop" is a job queue re-entering a step | `wake` jobs on the iii durable queue → `agentfx::harness::step` ([`worker.ts`](src/harness/worker.ts), [`step.ts`](src/harness/step.ts)) |
+| `reacting_to` watermark; status derived from the log | [`sweep.ts`](src/harness/sweep.ts): `needsInference` = ∃ stimulus with `seq >` the max assistant `reacting_to`. No status column. |
+| every tool is async; the model stays responsive | tools are fire-and-forget durable-queue jobs ([`tools.ts`](src/harness/tools.ts)); the step returns without awaiting them |
+| no compaction — windowing, not summary | [`window.ts`](src/harness/window.ts): turn-aware, drop-from-front, cache-stable prefix |
+| tool result IS the idempotency record | dedup on `tool_result` existence + a per-worker in-flight guard |
+
+The model is an injected `Model` interface, so the same harness runs a deterministic stub (for the
+crash proof) or real Claude:
+
+```bash
+# start the engine first:  (cd ../quickstart && iii --config config.yaml)
+npm run harness:durable    # spawns a worker, sends "21+21 then +100", HARD-KILLs it mid-turn
+                           #   (process-group kill, first tool in flight), spawns a second worker →
+                           #   the queue redelivers the in-flight job, the loop RESUMES from the log
+                           #   and finishes 142 on the new worker. PASS prints the w1→w2 hand-off.
+npm run harness:claude     # the same durable loop driven by real Claude (claude-opus-4-8), whose
+                           #   `add` tool is the Python pymath::add worker. Needs ANTHROPIC_API_KEY
+                           #   (+ ANTHROPIC_BASE_URL) and pymath_worker.py running.
+npm run harness:worker -- --model stub|claude   # run a standalone (killable) worker
+```
+
+The crash proof's log makes the hand-off explicit — each event records which worker wrote it:
+
+```
+#1 [client] user: what is 21+21, then add 100?
+#2 [w1]     assistant tools=[add(21,21)]   ← w1 starts the turn, then is HARD-KILLED mid-tool
+#3 [w2]     tool_result add → 42           ← w2 resumes from the file-backed log…
+#4 [w2]     assistant tools=[add(42,100)]
+#5 [w2]     tool_result add → 142
+#6 [w2]     assistant "142"                 ← …and finishes. The loop is the queue.
+```
+
+**Scope** — a faithful core, not all of aios: single-session; the model is injected; no
+multi-channel / memory-stores / sandbox / permissions. **Honest limits:** durability is across
+*worker* crashes (the in-memory `builtin` queue redelivers; an *engine* restart loses in-flight
+wakes — the file-backed log survives, but resuming would need a startup recovery sweep, not built).
+Cross-worker concurrency on one session is a non-goal (the dedup guards are per-worker). At-least-once
+means a crash between a tool's side effect and its result event re-runs the tool — `ToolImpl` gets
+`ctx.idempotencyKey` (the `toolCallId`) so a real tool can dedupe. A model call that errors past a
+bounded retry records a durable error event instead of spinning. Append is two ops (claim seq, then
+write), so a crash between them leaves a benign seq *gap* — `readLog`/`sweep` tolerate gaps.
+
 ## How `runDist` lowers to iii
 
 | node | `runMemory` | `runDist` (iii) |
